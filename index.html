@@ -318,6 +318,8 @@ h1 { text-shadow: 0 4px 0 rgba(0,0,0,.28), 0 0 60px rgba(255,59,59,.18); animati
 .mtime { font-size: .7rem; color: var(--muted); }
 .mtext { font-size: .93rem; line-height: 1.4; color: var(--text); overflow-wrap: anywhere; }
 .chat-form { background: rgba(255,255,255,.02); }
+.chat-note[hidden] { display: none; }
+.chat-note { margin: 0 12px 8px; padding: 9px 12px; border-radius: 10px; background: rgba(255,59,59,.12); border: 1px solid rgba(255,59,59,.45); color: #ffa3a3; font-size: .85rem; line-height: 1.4; }
 @media (prefers-reduced-motion: reduce) { .msg:last-child { animation: none; } }
 .pager .cur { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 50%; background: var(--tab); color: #1b1530; font: 400 .9rem var(--display); }
 </style>
@@ -364,6 +366,7 @@ h1 { text-shadow: 0 4px 0 rgba(0,0,0,.28), 0 0 60px rgba(255,59,59,.18); animati
 <aside class="chat" id="chat" aria-label="Global chat">
   <div class="chat-head"><div>chat<small id="chatStatus">connecting…</small></div><button id="chatClose" type="button" aria-label="Close chat">&times;</button></div>
   <div class="chat-msgs" id="chatMsgs" aria-live="polite"></div>
+  <div class="chat-note" id="chatNote" role="alert" hidden></div>
   <form class="chat-form" id="chatForm" autocomplete="off">
     <input id="chatText" maxlength="200" aria-label="Message" placeholder="say something">
     <button class="send" type="submit">send</button>
@@ -922,13 +925,17 @@ h1 { text-shadow: 0 4px 0 rgba(0,0,0,.28), 0 0 60px rgba(255,59,59,.18); animati
   });
 
   function loadMuted() {
-    odb("GET", "muted").then(function (d) {
+    Promise.all([odb("GET", "muted"), odb("GET", "mutes")]).then(function (r) {
       var box = $("oMuted"); box.textContent = "";
-      Object.keys(d || {}).forEach(function (n) {
+      function add(label, path, who) {
         var row = hel("div", "oitem"), b = hel("button", null, "Unmute");
         b.type = "button";
-        b.addEventListener("click", function () { odb("DELETE", "muted/" + encodeURIComponent(n)).then(function () { say2(n + " can chat again."); loadMuted(); }).catch(oerr); });
-        row.appendChild(hel("span", null, n)); row.appendChild(b); box.appendChild(row);
+        b.addEventListener("click", function () { odb("DELETE", path).then(function () { say2(who + " can chat again."); loadMuted(); }).catch(oerr); });
+        row.appendChild(hel("span", null, label)); row.appendChild(b); box.appendChild(row);
+      }
+      Object.keys(r[0] || {}).forEach(function (n) { add(n, "muted/" + encodeURIComponent(n), n); });
+      Object.keys(r[1] || {}).forEach(function (n) {
+        if (r[1][n] > Date.now()) add(n + " (auto, until " + new Date(r[1][n]).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }) + ")", "mutes/" + encodeURIComponent(n), n);
       });
     }).catch(oerr);
   }
@@ -1399,6 +1406,27 @@ h1 { text-shadow: 0 4px 0 rgba(0,0,0,.28), 0 0 60px rgba(255,59,59,.18); animati
     if (t && exp) annTimer = setTimeout(function () { annText = ""; el.hidden = true; el.textContent = ""; }, Math.min(exp - Date.now(), 2147483647));
   });
 
+  // Messages go through /api/chat, which filters hate speech and mutes offenders for 5 minutes.
+  var chatNote = $("chatNote"), muteUntil = 0, muteTimer = null, noteTimer = null;
+  function muteTick() {
+    var left = Math.ceil((muteUntil - Date.now()) / 1000);
+    if (left <= 0) {
+      clearInterval(muteTimer); muteUntil = 0; input.disabled = false;
+      input.placeholder = session ? "say something" : "sign up to chat"; chatNote.hidden = true;
+      return;
+    }
+    input.placeholder = "Muted for " + Math.floor(left / 60) + ":" + (left % 60 < 10 ? "0" : "") + (left % 60);
+  }
+  function startMute(until, msg) {
+    muteUntil = until; input.value = ""; input.disabled = true;
+    chatNote.textContent = msg; chatNote.hidden = false;
+    clearInterval(muteTimer); muteTick(); muteTimer = setInterval(muteTick, 1000);
+  }
+  function flashNote(msg) {
+    chatNote.textContent = msg; chatNote.hidden = false;
+    clearTimeout(noteTimer); noteTimer = setTimeout(function () { chatNote.hidden = true; }, 6000);
+  }
+
   var last = 0;
   form.addEventListener("submit", function (e) {
     e.preventDefault();
@@ -1407,11 +1435,20 @@ h1 { text-shadow: 0 4px 0 rgba(0,0,0,.28), 0 0 60px rgba(255,59,59,.18); animati
     if (!text || now - last < 1500) return;
     last = now; input.value = "";
     token().then(function (tok) {
-      return fetch(base + "/messages.json?auth=" + encodeURIComponent(tok), {
-        method: "POST", body: JSON.stringify({ name: session.name, uid: session.uid, text: text, ts: { ".sv": "timestamp" } })
+      return fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": "Bearer " + tok },
+        body: JSON.stringify({ text: text })
       });
-    }).then(function (r) { if (!r.ok) throw new Error("send"); })
-      .catch(function () { statusEl.textContent = "send failed"; if (!session || Date.now() > session.exp + 3600000) setSession(null); });
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (d) { return { ok: r.ok, d: d || {} }; });
+    }).then(function (x) {
+      if (x.ok) return;
+      if (x.d.error === "blocked") startMute(x.d.until, "That message isn\u2019t allowed here. You\u2019re muted for 5 minutes.");
+      else if (x.d.error === "muted" && x.d.permanent) flashNote("You\u2019re muted by the owner.");
+      else if (x.d.error === "muted") startMute(x.d.until, "You\u2019re muted right now. You can chat again soon.");
+      else throw new Error("send");
+    }).catch(function () { statusEl.textContent = "send failed"; if (!session || Date.now() > session.exp + 3600000) setSession(null); });
   });
 })();
 </script>
